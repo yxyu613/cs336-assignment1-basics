@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from ast import Pass
+import multiprocessing
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+import re
+from typing import IO, Any, BinaryIO, Counter, Dict
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-
+from multiprocessing import Pool
+from typing import Counter as CounterType # For type hinting
+from cs336_basics.pretokenization_example import find_chunk_boundaries 
 
 def run_linear(
     d_in: int,
@@ -300,7 +305,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE $\\Theta$ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -561,11 +566,68 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+def process_chunk(args:tuple):
+
+    trunk, start, end, special_tokens, num_merges = args
+    
+    # 1 根据special_tokens_bytes划分文段
+
+    escaped_tokens = re.escape(special_tokens)
+    matches: list[str | Any] = re.split("|".join(escaped_tokens), trunk)
+    
+    
+    
+    vocab = { i : bytes([i]) for i in range(256)}
+    merges = []
+    words = {}
+    
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""" 
+    
+    # 2 预分词
+    for match in matches:
+        iters = re.finditer(PAT, match)
+        for iter in iters:
+            if iter.group() not in words:
+                words[iter.group()] = 1
+            else:
+                words[iter.group()] += 1
+        
+    # 3 生成字节对
+    for n in range(num_merges):  
+        if n == 0:
+            pairs_count = {}
+            for word, count in words.items():
+                word_byte = word.encode('utf-8')
+                for i in range(len(word_byte)-1):
+                    pair = (word_byte[i:i+1], word_byte[i+1:i+2])
+                    pairs_count[pair] = pairs_count.get(pair, 0) + count
+        else:       
+            for word, count in words.items():
+                word_byte = word.encode('utf-8')
+                for i in range(len(word_byte)-1):
+                    if any(word_byte[i:i+1], word_byte[i+1:i+2]) == max_pair:
+                        pre_pair = (word_byte[i-1:i], merge_tuple)
+                        post_pair = (merge_tuple, word_byte[i+2:i+3])
+                        if i-1>0:
+                            pairs_count[pre_pair] = pairs_count.get(pre_pair, 0) + count
+                        elif i+1<len(word_byte)-1:
+                            pairs_count[post_pair] = pairs_count.get(post_pair, 0) + count
+                        del pairs_count[max_pair]   
+                                 
+    # 4 merge
+        max_pair = max(pairs_count.items(), key=lambda item: item[1])
+        merges.append(max_pair)
+        merge_tuple = max_pair[0][0] + max_pair[0][1]
+        vocab[n+256] = merge_tuple
+            
+    return tuple(vocab, merges)
 
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
+    num_processes:int,
+    num_merges:int,
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
@@ -589,4 +651,32 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    
+    args = []
+    special_tokens_bytes = [ b's' for s in special_tokens]
+    # 字节型获取分块边界
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, special_tokens_bytes[0])
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            arg = (chunk, start, end, special_tokens)
+            args.append(arg)   
+            args.append(num_merges)
+        # Run pre-tokenization on your chunk and store the counts for each pre-token
+        
+    # 字符型在分线程运行    
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        results: list[tuple[dict[int, bytes], list[tuple[bytes, bytes]]]] = pool.map(process_chunk, args) 
+    
+    
+    all_vocab, all_merges = zip(*results)
+    final_vocab = {}
+    for each_vocab in all_vocab:
+        if final_vocab.get(each_vocab.item) is None:
+            final_vocab[each_vocab.item] = each_vocab.value
+    
+    final_vocab = {}
+    final_merges = []
+
+    return final_vocab, final_merges
